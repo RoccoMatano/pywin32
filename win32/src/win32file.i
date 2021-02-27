@@ -404,8 +404,8 @@ PyObject *py_DeviceIoControl(PyObject *self, PyObject *args, PyObject *kwargs)
 	PyObject *obOverlapped = Py_None;
 
 	DWORD dwIoControlCode;
-	void *InBuffer=NULL, *OutBuffer=NULL;
-	DWORD InBufferSize=0, OutBufferSize=0;
+	void *OutBuffer=NULL;
+	DWORD OutBufferSize=0;
 	BOOL bBuffer=FALSE;
 	
 	static char *keywords[]={"Device","IoControlCode","InBuffer","OutBuffer","Overlapped", NULL};
@@ -421,39 +421,44 @@ PyObject *py_DeviceIoControl(PyObject *self, PyObject *args, PyObject *kwargs)
 
 	if (!PyWinObject_AsHANDLE(obhFile, &hDevice))
 		return NULL;
-	if (!PyWinObject_AsReadBuffer(obInBuffer, &InBuffer, &InBufferSize, TRUE))
+    BufferView out_buf, in_buf(obInBuffer, false, true); // None Ok
+	if (!in_buf.ok())
 		return NULL;
 	if (!PyWinObject_AsOVERLAPPED(obOverlapped, &pOverlapped, TRUE))
 		return NULL;
 
 	OutBufferSize=PyLong_AsLong(obOutBuffer);
-	if (OutBufferSize!=(DWORD)-1 || !PyErr_Occurred()){
+	if (OutBufferSize!=(DWORD)-1 || !PyErr_Occurred()) {
 		// Return a writable buffer in asynch mode, otherwise a plain string
 		//	for backward compatibility
-		if (pOverlapped != NULL){
-			ret=PyBuffer_New(OutBufferSize);
-			if (ret==NULL)
+		if (pOverlapped != NULL) {
+			ret = PyBuffer_New(OutBufferSize);
+			if (ret == NULL)
 				return NULL;
-			if (!PyWinObject_AsWriteBuffer(ret, &OutBuffer, &OutBufferSize)){
-				Py_DECREF(ret);
-				return NULL;
-				}
+			if (!out_buf.init(ret, true)) {
+			    Py_DECREF(ret);
+			    return NULL;
+			    }
+            OutBuffer = out_buf.ptr();
+            OutBufferSize = out_buf.len();
 			}
-		else{
+		else {
 			ret = PyString_FromStringAndSize(NULL, OutBufferSize);
 			if (ret==NULL)
 				return NULL;
 			OutBuffer=PyString_AS_STRING(ret);
 			}
 		}
-	else{
+	else {
 		PyErr_Clear();
-		if (PyWinObject_AsWriteBuffer(obOutBuffer, &OutBuffer, &OutBufferSize, TRUE)){
+		if (out_buf.init(obOutBuffer, true, true)) {
+            OutBuffer = out_buf.ptr();
+            OutBufferSize = out_buf.len();
 			Py_INCREF(obOutBuffer);
 			ret=obOutBuffer;
 			bBuffer=TRUE;
 			}
-		else{
+		else {
 			PyErr_Clear();
 			return PyErr_Format(PyExc_TypeError,
 				"OutBuffer must be either a buffer size or writeable buffer object, not %s",
@@ -467,8 +472,8 @@ PyObject *py_DeviceIoControl(PyObject *self, PyObject *args, PyObject *kwargs)
 
 	ok = DeviceIoControl(hDevice,
                          dwIoControlCode,
-                         InBuffer,
-                         InBufferSize,
+                         in_buf.ptr(),
+                         in_buf.len(),
                          OutBuffer, 
                          OutBufferSize,
                          &numRead,
@@ -945,6 +950,7 @@ PyObject *MyReadFile(PyObject *self, PyObject *args)
 		}
 
 	void *buf = NULL;
+	BufferView pybuf;
 
 	bufSize = PyInt_AsLong(obBuf);
 	if ((bufSize!=(DWORD)-1) || !PyErr_Occurred()){
@@ -953,10 +959,12 @@ PyObject *MyReadFile(PyObject *self, PyObject *args)
 			if (obRet==NULL)
 				return NULL;
 			// This should never fail
-			if (!PyWinObject_AsWriteBuffer(obRet, &buf, &bufSize)){
+			if (!pybuf.init(obRet, true)) {
 				Py_DECREF(obRet);
 				return NULL;
 				}
+            buf = pybuf.ptr();
+            bufSize = pybuf.len();
 			}
 		else{
 			obRet=PyString_FromStringAndSize(NULL, bufSize);
@@ -968,10 +976,12 @@ PyObject *MyReadFile(PyObject *self, PyObject *args)
 		}
 	else{
 		PyErr_Clear();
-		if (!PyWinObject_AsWriteBuffer(obBuf, &buf, &bufSize,FALSE)){
+		if (!pybuf.init(obBuf, true)) {
 			PyErr_SetString(PyExc_TypeError, "Second param must be an integer or writeable buffer object");
 			return NULL;
 			}
+        buf = pybuf.ptr();
+        bufSize = pybuf.len();
 		// If they didn't pass an overlapped, then we can't return the
 		// original buffer as they have no way to know how many bytes
 		// were read - so leave obRet NULL and the ret will be a new
@@ -1017,8 +1027,6 @@ PyObject *MyWriteFile(PyObject *self, PyObject *args)
 	OVERLAPPED *pOverlapped;
 	PyObject *obhFile;
 	HANDLE hFile;
-	void *writeData;
-	DWORD writeSize;
 	PyObject *obWriteData;
 	PyObject *obOverlapped = NULL;
 
@@ -1027,8 +1035,9 @@ PyObject *MyWriteFile(PyObject *self, PyObject *args)
 		&obWriteData, // @pyparm string/<o PyOVERLAPPEDReadBuffer>|data||The data to write.
 		&obOverlapped))	// @pyparm <o PyOVERLAPPED>|ol|None|An overlapped structure
 		return NULL;
-	if (!PyWinObject_AsReadBuffer(obWriteData, &writeData, &writeSize, FALSE))
-		return NULL;
+    BufferView pybuf(obWriteData);
+    if (!pybuf.ok())
+        return NULL;
 
 	if (obOverlapped==NULL)
 		pOverlapped = NULL;
@@ -1042,7 +1051,7 @@ PyObject *MyWriteFile(PyObject *self, PyObject *args)
 	BOOL ok;
 	DWORD err = 0;
     Py_BEGIN_ALLOW_THREADS
-	ok = WriteFile(hFile, writeData, writeSize, &numWritten, pOverlapped);
+	ok = WriteFile(hFile, pybuf.ptr(), pybuf.len(), &numWritten, pOverlapped);
     Py_END_ALLOW_THREADS
 	if (!ok) {
 		err = GetLastError();
@@ -1486,6 +1495,7 @@ static PyObject *PyReadDirectoryChangesW(PyObject *self, PyObject *args)
 	if (obOverlappedRoutine != Py_None)
 		return PyErr_Format(PyExc_ValueError, "overlappedRoutine must be None");
 
+    BufferView pybuf;
 	void *buf = NULL;
 	DWORD bufSize = 0;
 	BOOL bBufMallocd = FALSE;
@@ -1500,10 +1510,12 @@ static PyObject *PyReadDirectoryChangesW(PyObject *self, PyObject *args)
 	}
 	else{
 		PyErr_Clear();
-		if (!PyWinObject_AsWriteBuffer(obBuffer, &buf, &bufSize, FALSE)){
+		if (!pybuf.init(obBuffer, true)) {
 			PyErr_SetString(PyExc_TypeError, "buffer param must be an integer or a buffer object");
 			goto done;
 			}
+        buf = pybuf.ptr();
+        bufSize = pybuf.len();
 		}
 
 	// OK, have a buffer and a size.
@@ -1752,10 +1764,16 @@ static PyObject *py_TransmitFile( PyObject *self, PyObject *args, PyObject *kwar
 	}
 	TRANSMIT_FILE_BUFFERS tf_buffers;
 	TRANSMIT_FILE_BUFFERS *ptf_buffers;
-	if (!PyWinObject_AsReadBuffer(obHead, &tf_buffers.Head, &tf_buffers.HeadLength, TRUE))
+	BufferView head(obHead, false, true);
+	if (!head.ok())
 		return NULL;
-	if (!PyWinObject_AsReadBuffer(obTail, &tf_buffers.Tail, &tf_buffers.TailLength, TRUE))
+	tf_buffers.Head = head.ptr();
+	tf_buffers.HeadLength = head.len();
+	BufferView tail(obTail, false, true);
+	if (!tail.ok())
 		return NULL;
+	tf_buffers.Tail = tail.ptr();
+	tf_buffers.TailLength = tail.len();
 
 	if (tf_buffers.Head || tf_buffers.Tail)
 		ptf_buffers = &tf_buffers;
@@ -1792,8 +1810,6 @@ static PyObject *py_ConnectEx( PyObject *self, PyObject *args, PyObject *kwargs 
 	PyObject *obConnecting = NULL;
 	PyObject *obBuf = Py_None;
 	PyObject *addro;
-	void *buffer=NULL;
-	DWORD buffer_len=0; 
 	int rc, error;
 	DWORD sent=0;
 	static char *keywords[]={"s","name","Overlapped","SendBuffer", NULL};
@@ -1807,7 +1823,8 @@ static PyObject *py_ConnectEx( PyObject *self, PyObject *args, PyObject *kwargs 
 	if (!PySocket_AsSOCKET(obConnecting, &sConnecting)) {
 		return NULL;
 	}
-	if (!PyWinObject_AsReadBuffer(obBuf, &buffer, &buffer_len, TRUE))
+	BufferView pybuf(obBuf, false, true); // None Ok
+	if (!pybuf.ok())
 		return NULL;
 
 	GUID guid = WSAID_CONNECTEX;
@@ -1895,7 +1912,7 @@ static PyObject *py_ConnectEx( PyObject *self, PyObject *args, PyObject *kwargs 
 
 	rc=0;
 	Py_BEGIN_ALLOW_THREADS;
-	if (!lpfnConnectEx(sConnecting, res->ai_addr, res->ai_addrlen, buffer, buffer_len, &sent, pOverlapped))
+	if (!lpfnConnectEx(sConnecting, res->ai_addr, res->ai_addrlen, pybuf.ptr(), pybuf.len(), &sent, pOverlapped))
 		rc=WSAGetLastError();
 	Py_END_ALLOW_THREADS;
 	WspiapiFreeAddrInfo(res);
@@ -1927,11 +1944,9 @@ static PyObject *MyAcceptEx
 	SOCKET sListening;
 	SOCKET sAccepting;
 	PyObject *obOverlapped = NULL;
-	DWORD dwBufSize = 0;
 	PyObject *obListening = NULL;
 	PyObject *obAccepting = NULL;
 	PyObject *obBuf = NULL;
-	void *buf = NULL;
 	DWORD cBytesRecvd = 0;
 	BOOL ok;
 	int rc = 0;
@@ -1990,10 +2005,10 @@ static PyObject *MyAcceptEx
 		return NULL;
 	}
 
-	if (!PyWinObject_AsWriteBuffer(obBuf, &buf, &dwBufSize))
+	BufferView pybuf(obBuf, true);
+	if (!pybuf.ok())
 		return NULL;
-	if (dwBufSize < (DWORD)iMinBufferSize )
-		{
+	if (pybuf.len() < (DWORD)iMinBufferSize ) {
 		PyErr_Format(
 			PyExc_ValueError,
 			"Second param must be at least %ld bytes long",
@@ -2006,8 +2021,8 @@ static PyObject *MyAcceptEx
 	ok = AcceptEx(
 		sListening,
 		sAccepting,
-		buf,
-		dwBufSize - iMinBufferSize,
+		pybuf.ptr(),
+		pybuf.len() - iMinBufferSize,
 		wsProtInfo.iMaxSockAddr + 16,
 		wsProtInfo.iMaxSockAddr + 16,
 		&cBytesRecvd,
@@ -2432,8 +2447,11 @@ PyObject *MyWSASend
 		return NULL;
 	}
 
-	if (!PyWinObject_AsReadBuffer(obBuf, (void **)&wsBuf.buf, &wsBuf.len, FALSE))
+    BufferView pybuf(obBuf);
+    if (!pybuf.ok())
 		return NULL;
+    wsBuf.buf = (CHAR*)pybuf.ptr();
+    wsBuf.len = pybuf.len();
 
 	Py_BEGIN_ALLOW_THREADS;
 	rc = WSASend(
@@ -2527,8 +2545,11 @@ PyObject *MyWSARecv
 		return NULL;
 	}
 
-	if (!PyWinObject_AsWriteBuffer(obBuf, (void **)&wsBuf.buf, &wsBuf.len, FALSE))
+    BufferView pybuf(obBuf, true);
+    if (!pybuf.ok())
 		return NULL;
+    wsBuf.buf = (CHAR*)pybuf.ptr();
+    wsBuf.len = pybuf.len();		
 
 	Py_BEGIN_ALLOW_THREADS;
 	rc = WSARecv(
